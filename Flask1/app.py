@@ -1,193 +1,276 @@
 import math
-from datetime import *
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+app.json.ensure_ascii = False
 
-now = datetime.now(timezone.utc)
-tasks = [
-    {
-        "id": 1,
-        "title": "Купить молоко",
-        "done": True,
-        "created_at": (now + timedelta(seconds=1)).isoformat()
-    },
-    {
-        "id": 2,
-        "title": "Выучить REST",
-        "done": False,
-        "created_at": (now + timedelta(seconds=2)).isoformat()
-    },
-    {
-        "id": 3,
-        "title": "Сдать лабораторную",
-        "done": True,
-        "created_at": (now + timedelta(seconds=3)).isoformat()
-    },
-    {
-        "id": 4,
-        "title": "Проверить почту",
-        "done": False,
-        "created_at": (now + timedelta(seconds=4)).isoformat()
-    },
-    {
-        "id": 5,
-        "title": "Позвонить маме",
-        "done": False,
-        "created_at": (now + timedelta(seconds=5)).isoformat()
-    },
-]
+tasks = []
+next_id = 1
 
-next_id = 6
+MAX_TITLE_LEN = 200
+DEFAULT_PER_PAGE = 10
+MAX_PER_PAGE = 100
 
 
-def clean_spaces(text: str) -> str:
-    return " ".join(text.strip().split())
+def now_iso():
+    """Текущее время в ISO 8601 UTC."""
+    return datetime.now(timezone.utc).isoformat()
 
 
-def validate_title(title, current_task_id=None):
-    if not isinstance(title, str):
-        return None, ("Поле title должно быть строкой", 400)
-    
-    cleaned = clean_spaces(title)
-    if not cleaned:
-        return None, ("Название задачи не может быть пустым", 422)
-    if len(cleaned) > 200:
-        return None, ("Длина заголовка не должна превышать 200 символов", 400)
-
-    # Проверка на дубликаты
-    for t in tasks:
-        if current_task_id is not None and t["id"] == current_task_id:
-            continue
-        if clean_spaces(t["title"]).lower() == cleaned.lower():
-            return None, ("Задача с таким названием уже существует", 409)
-
-    return cleaned, None
+def normalize(title):
+    """Нормализация title для сравнения: убрать пробелы и перевести в нижний регистр."""
+    return " ".join(title.split()).lower()
 
 
-@app.get("/")
-def service_info():
-    return jsonify({
-        "service": "ToDo API",
-        "endpoints": [
-            "GET /",
-            "GET /tasks",
-            "GET /tasks/<id>",
-            "POST /tasks",
-            "PUT /tasks/<id>",
-            "PATCH /tasks/<id>",
-            "DELETE /tasks/<id>"
-        ]
-    }), 200
+def err(message, code):
+    """JSON-ответ об ошибке: {"error": message} с заданным кодом."""
+    return jsonify({"error": message}), code
+
+
+def find_task(task_id):
+    """Найти задачу по id или вернуть None."""
+    for task in tasks:
+        if task["id"] == task_id:
+            return task
+    return None
+
+
+def title_exists(title, exclude_id=None):
+    """Есть ли уже задача с таким title (с нормализацией)?
+
+    exclude_id — id задачи, которую переименовываем (её собственное название
+    дубликатом не считается).
+    """
+    norm = normalize(title)
+    return any(
+        normalize(t["title"]) == norm
+        for t in tasks
+        if exclude_id is None or t["id"] != exclude_id
+    )
+
+
+def validate_title(data, exclude_id=None):
+    """Валидация title. Возвращает (title, None) или (None, error_response).
+
+    Правила:
+      - отсутствует           -> 400
+      - не строка / пустая    -> 422
+      - длиннее MAX_TITLE_LEN -> 422
+      - дубликат              -> 409
+    """
+    if not isinstance(data, dict) or "title" not in data:
+        return None, err("Поле title обязательно", 400)
+
+    title = data["title"]
+    if not isinstance(title, str) or not title.strip():
+        return None, err("Поле title должно быть непустой строкой", 422)
+
+    stripped = title.strip()
+    if len(stripped) > MAX_TITLE_LEN:
+        return None, err(f"Длина поля title не должна превышать {MAX_TITLE_LEN} символов", 422)
+
+    if title_exists(stripped, exclude_id=exclude_id):
+        return None, err("Задача с таким названием уже существует", 409)
+
+    return stripped, None
+
+
+def parse_done(value, default=False):
+    """Приведение поля done к boolean."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ("true", "1")
+    return bool(value)
+
+
+def seed():
+    """Заполнить хранилище демонстрационными задачами при старте."""
+    global tasks, next_id
+    now = datetime.now(timezone.utc)
+    demo_tasks = [
+        ("Купить молоко", True),
+        ("Выучить REST", False),
+        ("Сдать лабораторную", True),
+        ("Проверить почту", False),
+        ("Позвонить маме", False),
+    ]
+    tasks.clear()
+    for i, (title, done) in enumerate(demo_tasks):
+        tasks.append({
+            "id": i + 1,
+            "title": title,
+            "done": done,
+            "created_at": (now - timedelta(hours=5 - i)).isoformat(),
+        })
+    next_id = 6
+
+
+def get_json_data():
+    try:
+        if request.is_json:
+            raw = request.get_json(silent=True)
+        elif request.data:
+            raw = request.get_json(force=True, silent=True)
+        else:
+            return None, False
+    except Exception:
+        return None, False
+
+    if not isinstance(raw, dict):
+        return None, False
+
+    return raw, True
+
+
+# Вызов seed() при импорте модуля
+seed()
+
+
+# ---------------------------------------------------------------------------
+# Вьюхи
+# ---------------------------------------------------------------------------
 
 
 @app.get("/tasks")
 def list_tasks():
-    res = list(tasks)
+    """GET /tasks — список с фильтрами, сортировкой и пагинацией.
 
+    Query: done, q, sort, order, page, per_page.
+    Ответ: {items, page, per_page, total, pages}.
+    """
+    filtered = list(tasks)
+
+    # Фильтр done
     done_param = request.args.get("done")
     if done_param is not None:
         if done_param.lower() == "true":
-            res = [t for t in res if t["done"] is True]
+            filtered = [t for t in filtered if t["done"] is True]
         elif done_param.lower() == "false":
-            res = [t for t in res if t["done"] is False]
+            filtered = [t for t in filtered if t["done"] is False]
         else:
-            return jsonify({"error": "Невалидное значение done"}), 400
+            return err("Параметр done должен иметь значение true или false", 400)
 
+    # Поиск q
     q_param = request.args.get("q")
     if q_param is not None:
-        res = [t for t in res if q_param.lower() in t["title"].lower()]
+        q_norm = normalize(q_param)
+        filtered = [t for t in filtered if q_norm in normalize(t["title"])]
 
-    sort_field = request.args.get("sort", "id")
-    order = request.args.get("order", "asc").lower()
+    # Сортировка sort 
+    sort = request.args.get("sort", "created_at")
+    if sort not in ("id", "title", "created_at"):
+        return err("Параметр sort должен быть одним из: id, title, created_at", 400)
 
-    if sort_field not in ["id", "title", "created_at"]:
-        return jsonify({"error": "Невалидное поле сортировки"}), 400
-    if order not in ["asc", "desc"]:
-        return jsonify({"error": "Невалидный порядок сортировки"}), 400
+    # Порядок order
+    order = request.args.get("order", "asc")
+    if order not in ("asc", "desc"):
+        return err("Параметр order должен быть 'asc' или 'desc'", 400)
 
-    reverse = (order == "desc")
-    if sort_field == "title":
-        res.sort(key=lambda x: x["title"].lower(), reverse=reverse)
-    else:
-        res.sort(key=lambda x: x[sort_field], reverse=reverse)
-
+    # Пагинация: page (целое >= 1, по умолчанию 1)
+    page_param = request.args.get("page", 1)
     try:
-        page = int(request.args.get("page", 1))
-        per_page = int(request.args.get("per_page", 10))
-    except ValueError:
-        return jsonify({"error": "page и per_page должны быть числами"}), 400
+        if isinstance(page_param, str) and "." in page_param:
+            return err("Параметр page должен быть целым числом не меньше 1", 400)
+        page = int(page_param)
+        if page < 1:
+            return err("Параметр page должен быть целым числом не меньше 1", 400)
+    except (ValueError, TypeError):
+        return err("Параметр page должен быть целым числом не меньше 1", 400)
 
-    if page < 1 or per_page < 1 or per_page > 100:
-        return jsonify({"error": "Параметры пагинации вне диапазона"}), 400
+    # Пагинация: per_page (целое от 1 до 100, по умолчанию 10)
+    per_page_param = request.args.get("per_page", DEFAULT_PER_PAGE)
+    try:
+        if isinstance(per_page_param, str) and "." in per_page_param:
+            return err(f"Параметр per_page должен быть целым числом от 1 до {MAX_PER_PAGE}", 400)
+        per_page = int(per_page_param)
+        if per_page < 1 or per_page > MAX_PER_PAGE:
+            return err(f"Параметр per_page должен быть в диапазоне от 1 до {MAX_PER_PAGE}", 400)
+    except (ValueError, TypeError):
+        return err(f"Параметр per_page должен быть целым числом от 1 до {MAX_PER_PAGE}", 400)
 
-    total = len(res)
-    pages = math.ceil(total / per_page) if total > 0 else 0
+    # Сортировка
+    reverse = (order == "desc")
+    filtered.sort(key=lambda t: t[sort], reverse=reverse)
+
+    total = len(filtered)
+    pages = max(1, math.ceil(total / per_page))
 
     start = (page - 1) * per_page
     end = start + per_page
-    items = res[start:end] if start < total else []
+    items = filtered[start:end]
 
     return jsonify({
         "items": items,
-        "total": total,
         "page": page,
         "per_page": per_page,
-        "pages": pages
+        "total": total,
+        "pages": pages,
     }), 200
 
 
 @app.get("/tasks/<int:task_id>")
 def get_task(task_id):
-    for t in tasks:
-        if t["id"] == task_id:
-            return jsonify(t), 200
-    return jsonify({"error": "Задача не найдена"}), 404
+    """GET /tasks/<id> — одна задача. 404, если нет."""
+    task = find_task(task_id)
+    if task is None:
+        return err("задача не найдена", 404)
+    return jsonify(task), 200
 
 
 @app.post("/tasks")
 def create_task():
+    """POST /tasks — создать задачу.
+
+    Тело — JSON-объект {title, done?}.
+    Валидация title через validate_title().
+    Ответ 201 с созданной задачей.
+    """
     global next_id
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict) or "title" not in data:
-        return jsonify({"error": "Поле title обязательно"}), 400
+    data, is_valid = get_json_data()
+    if not is_valid:
+        return err("Тело запроса должно быть JSON-объектом", 400)
 
-    title, err = validate_title(data["title"])
-    if err:
-        return jsonify({"error": err[0]}), err[1]
+    title, error_response = validate_title(data)
+    if error_response is not None:
+        return error_response
 
-    done = data.get("done", False)
-    if not isinstance(done, bool):
-        return jsonify({"error": "done должно быть bool"}), 400
+    done = parse_done(data.get("done", False))
 
-    task = {
+    new_task = {
         "id": next_id,
         "title": title,
         "done": done,
-        "created_at": datetime.now(timezone.utc).isoformat()
+        "created_at": now_iso(),
     }
-    tasks.append(task)
     next_id += 1
-    return jsonify(task), 201
+    tasks.append(new_task)
+    return jsonify(new_task), 201
 
 
 @app.put("/tasks/<int:task_id>")
 def replace_task(task_id):
-    task = next((t for t in tasks if t["id"] == task_id), None)
-    if not task:
-        return jsonify({"error": "Задача не найдена"}), 404
+    """PUT /tasks/<id> — полная замена ресурса.
 
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict) or "title" not in data:
-        return jsonify({"error": "Поле title обязательно"}), 400
+    Как POST, но: 404 если нет задачи; validate_title(..., exclude_id=task_id);
+    отсутствующий done -> False.
+    """
+    task = find_task(task_id)
+    if task is None:
+        return err("задача не найдена", 404)
 
-    title, err = validate_title(data["title"], current_task_id=task_id)
-    if err:
-        return jsonify({"error": err[0]}), err[1]
+    data, is_valid = get_json_data()
+    if not is_valid:
+        return err("Тело запроса должно быть JSON-объектом", 400)
 
-    done = data.get("done", False)
-    if not isinstance(done, bool):
-        return jsonify({"error": "done должно быть bool"}), 400
+    title, error_response = validate_title(data, exclude_id=task_id)
+    if error_response is not None:
+        return error_response
+
+    done = parse_done(data.get("done", False))
 
     task["title"] = title
     task["done"] = done
@@ -196,38 +279,85 @@ def replace_task(task_id):
 
 @app.patch("/tasks/<int:task_id>")
 def update_task(task_id):
-    task = next((t for t in tasks if t["id"] == task_id), None)
-    if not task:
-        return jsonify({"error": "Задача не найдена"}), 404
+    """PATCH /tasks/<id> — частичное обновление.
 
-    data = request.get_json(silent=True)
-    if not isinstance(data, dict):
-        return jsonify({"error": "Ожидался JSON-объект"}), 400
+    Обновляются только переданные поля (title и/или done).
+    """
+    task = find_task(task_id)
+    if task is None:
+        return err("задача не найдена", 404)
+
+    data, is_valid = get_json_data()
+    if not is_valid:
+        return err("Тело запроса должно быть JSON-объектом", 400)
 
     if "title" in data:
-        title, err = validate_title(data["title"], current_task_id=task_id)
-        if err:
-            return jsonify({"error": err[0]}), err[1]
-        task["title"] = title
+        raw_title = data["title"]
+        if not isinstance(raw_title, str) or not raw_title.strip():
+            return err("Поле title должно быть непустой строкой", 422)
+        stripped = raw_title.strip()
+        if len(stripped) > MAX_TITLE_LEN:
+            return err(f"Длина поля title не должна превышать {MAX_TITLE_LEN} символов", 422)
+        if normalize(stripped) != normalize(task["title"]):
+            if title_exists(stripped, exclude_id=task_id):
+                return err("Задача с таким названием уже существует", 409)
+        task["title"] = stripped
 
     if "done" in data:
-        if not isinstance(data["done"], bool):
-            return jsonify({"error": "done должно быть bool"}), 400
-        task["done"] = data["done"]
+        task["done"] = parse_done(data["done"])
 
     return jsonify(task), 200
 
 
 @app.delete("/tasks/<int:task_id>")
 def delete_task(task_id):
-    global tasks
-    task = next((t for t in tasks if t["id"] == task_id), None)
-    if not task:
-        return jsonify({"error": "Задача не найдена"}), 404
-
-    tasks = [t for t in tasks if t["id"] != task_id]
+    """DELETE /tasks/<id> — удалить задачу. 204 или 404."""
+    task = find_task(task_id)
+    if task is None:
+        return err("задача не найдена", 404)
+    tasks.remove(task)
     return "", 204
 
 
+@app.get("/")
+def index():
+    """GET / — описание сервиса."""
+    return jsonify({
+        "service": "tasks-api",
+        "seed": len(tasks),
+        "endpoints": [
+            "GET / - описание сервиса",
+            "GET /tasks - список задач с фильтрацией, сортировкой и пагинацией",
+            "GET /tasks/<id> - получение одной задачи по id",
+            "POST /tasks - создание новой задачи",
+            "PUT /tasks/<id> - полная замена задачи",
+            "PATCH /tasks/<id> - частичное обновление задачи",
+            "DELETE /tasks/<id> - удаление задачи",
+        ],
+    }), 200
+
+
+# Формат ошибок (5.1)
+@app.errorhandler(400)
+def handle_400(e):
+    msg = e.description if hasattr(e, "description") and isinstance(e.description, str) and e.description != "Bad Request" else "Некорректный запрос"
+    return err(msg, 400)
+
+
+@app.errorhandler(404)
+def handle_404(e):
+    return err("Ресурс не найден", 404)
+
+
+@app.errorhandler(405)
+def handle_405(e):
+    return err("Метод не поддерживается", 405)
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    return err("Внутренняя ошибка сервера", 500)
+
+
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
