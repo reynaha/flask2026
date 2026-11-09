@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Загрузка файлов</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <h1>Загрузка файлов</h1>
+
+        <!-- Flash messages for success and error notifications -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                <div class="flashes">
+                    {% for category, message in messages %}
+                        <div class="flash flash-{{ category }}">
+                            {{ message }}
+                        </div>
+                    {% endfor %}
+                </div>
+            {% endif %}
+        {% endwith %}
+
+        <form class="upload-form" method="POST" action="{{ url_for('index') }}" enctype="multipart/form-data">
+            <input type="file" name="file" id="file-input" required>
+            <input type="submit" value="Загрузить">
+        </form>
+
+        <table class="files-table" id="files-table">
+            <thead>
+                <tr>
+                    <th class="col-orig-name">Пользовательское имя файла</th>
+                    <th class="col-server-path">Путь к файлу на сервере</th>
+                    <th class="col-upload-date">Дата загрузки</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% if files and files|length > 0 %}
+                    {% for file in files %}
+                        <tr>
+                            <td class="col-orig-name" title="{{ file.user_filename }}">{{ file.user_filename }}</td>
+                            <td class="col-server-path font-mono">
+                                <a href="/{{ file.file_path }}" target="_blank" title="Открыть файл">{{ file.file_path }}</a>
+                            </td>
+                            <td class="col-upload-date">{{ file.date }}</td>
+                        </tr>
+                    {% endfor %}
+                {% endif %}
+            </tbody>
+        </table>
+    </div>
+</body>
+</html>
